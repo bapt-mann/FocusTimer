@@ -6,6 +6,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!--
+        WRITE_SECURE_SETTINGS : permet à l'app d'activer elle-même le service
+        d'accessibilité sans passer par l'UI (bypass le compte à rebours 10s).
+        Doit être grantée UNE SEULE FOIS via adb :
+            adb shell pm grant com.example.focustimer android.permission.WRITE_SECURE_SETTINGS
+    -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="true"

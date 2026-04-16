@@ -1,10 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Overlay plein écran pour TikTok / YouTube / dangerZones.
-    Image de fond + timer 100s. Le bouton "Accueil" a été retiré :
-    pour quitter, utiliser le geste/bouton Home du système.
+    Overlay Instagram PARTIEL : image + timer.
+    Hauteur pilotée par AppCheckService.ensureInstagramOverlayShown()
+    via la constante bottomReserveDp (laisse la bottom nav d'Insta libre).
 
-    Timer positionné avec les biais originaux (0.643, 0.402).
+    Le timer est positionné avec les biais originaux (0.643, 0.402) pour
+    concorder avec la composition de l'image de fond.
 -->
 <androidx.constraintlayout.widget.ConstraintLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
