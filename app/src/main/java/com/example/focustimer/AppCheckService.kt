@@ -3,6 +3,7 @@ package com.example.focustimer
 import android.accessibilityservice.AccessibilityService
 import android.graphics.PixelFormat
 import android.os.CountDownTimer
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
@@ -24,8 +25,36 @@ class AppCheckService : AccessibilityService() {
     /** Package pour lequel le timer est en train de tourner. */
     private var timerPackage: String? = null
 
-    /** Package pour lequel l'utilisateur a attendu les 100s et est donc libre. */
+    /**
+     * Package pour lequel l'utilisateur a attendu les 100s et est donc libre.
+     * NB : utilisé UNIQUEMENT pour TikTok/YouTube. Pour Instagram, on n'utilise
+     * pas ce mécanisme — chaque changement d'écran ré-évalue la situation.
+     */
     private var unlockedPackage: String? = null
+
+    /**
+     * Dernier écran Instagram détecté (pour le debug log uniquement).
+     */
+    private var lastInstagramScreen: InstagramScreenDetector.Screen? = null
+
+    /**
+     * Timestamp de la dernière évaluation Insta (throttling pour éviter
+     * de spammer sur les WINDOW_CONTENT_CHANGED qui arrivent en rafale).
+     */
+    private var lastInstagramEvalMs: Long = 0L
+
+    /** Indique que le timer Insta est terminé et qu'on laisse l'user tranquille
+     *  tant qu'il reste sur BLOCKED. Si on quitte BLOCKED, ce flag saute. */
+    private var instagramFeedFinished: Boolean = false
+
+    /**
+     * Doit-on relancer le timer à 100s au prochain écran BLOCKED ?
+     * Mis à true dès qu'on quitte la zone BLOCKED (Profil, Messages, autre app).
+     * Mis à false quand le timer est effectivement (re)lancé sur BLOCKED.
+     * Permet d'éviter que les événements WINDOWS_CHANGED parasites (className=null)
+     * ne relancent le timer en boucle alors que l'utilisateur est déjà sur BLOCKED.
+     */
+    private var instagramNeedsRestart: Boolean = true
 
     // Distingue l'overlay "plein écran" (TikTok/YouTube)
     // de l'overlay "partiel" (Instagram, bottom nav libre).
@@ -34,22 +63,40 @@ class AppCheckService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         // On traite :
         //  - WINDOW_STATE_CHANGED / WINDOWS_CHANGED : changement d'écran/activity
-        //  - VIEW_SELECTED : changement d'onglet Insta qui ne change pas l'activity
+        //  - VIEW_SELECTED : changement d'onglet (bottom nav Insta)
+        //  - WINDOW_CONTENT_CHANGED : changement de Fragment / contenu (back-up
+        //    critique pour Insta car les transitions Feed <-> Messages n'émettent
+        //    pas toujours WINDOW_STATE_CHANGED)
         if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event?.eventType != AccessibilityEvent.TYPE_WINDOWS_CHANGED &&
-            event?.eventType != AccessibilityEvent.TYPE_VIEW_SELECTED) {
+            event?.eventType != AccessibilityEvent.TYPE_VIEW_SELECTED &&
+            event?.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
             return
         }
 
-        val rootNode = rootInActiveWindow ?: return
+        val rootNode = rootInActiveWindow
+        if (rootNode == null) {
+            FocusLog.d("event type=${eventTypeName(event.eventType)} pkg=${event.packageName} class=${event.className} rootNode=NULL -> skip")
+            return
+        }
         val currentPackage = rootNode.packageName?.toString() ?: event.packageName?.toString() ?: return
 
         if (currentPackage == "com.example.focustimer") return
 
-        // Si on change de package et qu'on avait un unlock valide pour l'ancien,
-        // on l'invalide (chaque appli a son propre cooldown 100s).
+        FocusLog.d(
+            "event type=${eventTypeName(event.eventType)} pkg=$currentPackage class=${event.className} " +
+                "state{unlockedPkg=$unlockedPackage lastInstaScreen=$lastInstagramScreen feedFinished=$instagramFeedFinished timer=${if (countDownTimer != null) "RUN" else "null"} overlay=$overlayMode}"
+        )
+
+        // Si on change de package : on invalide tout état Insta mémorisé
+        // (le cooldown ne "transporte" pas entre apps).
         if (unlockedPackage != null && unlockedPackage != currentPackage) {
             unlockedPackage = null
+        }
+        if (currentPackage != InstagramScreenDetector.PACKAGE) {
+            lastInstagramScreen = null
+            instagramFeedFinished = false
+            instagramNeedsRestart = true   // quitter Insta = reprendre à 0 au retour
         }
 
         // --- 1. Détection tentative de désactivation de l'appli ---
@@ -74,33 +121,64 @@ class AppCheckService : AccessibilityService() {
         }
 
         // --- 2. Cas Instagram : détection 3 états ---
-        //   PROFILE  -> overlay caché + timer reset
-        //   MESSAGES -> overlay gardé + timer reset (pas d'attente possible en DM)
-        //   BLOCKED  -> overlay partiel + timer 100s qui tourne
+        //   PROFILE / MESSAGES -> overlay caché + timer reset (zones autorisées)
+        //   BLOCKED            -> overlay partiel + timer 100s qui tourne
+        //
+        // Logique : on ne persiste PAS un "déblocage global" pour Insta. À chaque
+        // retour sur une zone bloquée depuis une zone autorisée, le timer repart
+        // à 100s. Seul un séjour continu sur BLOCKED permet de laisser finir les
+        // 100s et de scroller ensuite.
         if (currentPackage == InstagramScreenDetector.PACKAGE) {
-            if (unlockedPackage == currentPackage) {
-                // Déjà unlocked (100s déjà attendus cette session) : accès libre
-                hideOverlayOnly()
+            val isContentChanged =
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+
+            // Throttle les content_changed : ils arrivent en rafale.
+            val now = SystemClock.elapsedRealtime()
+            if (isContentChanged && (now - lastInstagramEvalMs) < 250) {
+                FocusLog.d("  insta throttled (content_changed < 250ms)")
                 return
             }
+            lastInstagramEvalMs = now
 
-            when (InstagramScreenDetector.detect(event, rootNode)) {
-                InstagramScreenDetector.Screen.PROFILE -> {
-                    // Mon profil : on enlève l'overlay ET on reset le timer
+            val screen = InstagramScreenDetector.detect(event, rootNode)
+            FocusLog.d("  insta detected screen=$screen (needsRestart=$instagramNeedsRestart feedFinished=$instagramFeedFinished)")
+
+            when (screen) {
+                InstagramScreenDetector.Screen.PROFILE,
+                InstagramScreenDetector.Screen.MESSAGES -> {
+                    // Zone autorisée : on marque qu'il faudra reprendre à 100s
+                    // dès que l'utilisateur reviendra sur une zone bloquée.
+                    FocusLog.d("  -> ALLOWED zone, hide overlay + cancel timer + needsRestart=true")
+                    instagramNeedsRestart = true
+                    instagramFeedFinished = false
                     hideOverlayOnly()
                     cancelTimerOnly()
                 }
-                InstagramScreenDetector.Screen.MESSAGES -> {
-                    // Messagerie : overlay reste visible MAIS timer reset
-                    ensureInstagramOverlayShown()
-                    cancelTimerOnly()
-                }
                 InstagramScreenDetector.Screen.BLOCKED -> {
-                    // Feed/Reels/etc : overlay + timer qui tourne
-                    ensureInstagramOverlayShown()
-                    ensureTimerRunning(currentPackage)
+                    if (instagramNeedsRestart) {
+                        // Première détection BLOCKED après avoir quitté la zone :
+                        // on relance le timer à 100s.
+                        FocusLog.d("  -> BLOCKED (fresh entry), start fresh 100s timer")
+                        instagramNeedsRestart = false
+                        instagramFeedFinished = false
+                        cancelTimerOnly()
+                        ensureInstagramOverlayShown()
+                        ensureTimerRunning(currentPackage)
+                    } else {
+                        // Déjà en zone BLOCKED : on continue sans toucher au timer.
+                        if (instagramFeedFinished) {
+                            FocusLog.d("  -> BLOCKED (stay) + feedFinished=true, hide overlay")
+                            hideOverlayOnly()
+                        } else {
+                            FocusLog.d("  -> BLOCKED (stay) + feedFinished=false, ensure overlay+timer")
+                            ensureInstagramOverlayShown()
+                            ensureTimerRunning(currentPackage)
+                        }
+                    }
                 }
             }
+
+            lastInstagramScreen = screen
             return
         }
 
@@ -113,6 +191,11 @@ class AppCheckService : AccessibilityService() {
             if (unlockedPackage == currentPackage) {
                 hideOverlayOnly()
             } else {
+                // Si un timer pour un autre package tourne encore, on l'annule
+                // avant de démarrer celui de ce package.
+                if (timerPackage != null && timerPackage != currentPackage) {
+                    cancelTimerOnly()
+                }
                 ensureFullScreenOverlayShown()
                 ensureTimerRunning(currentPackage)
             }
@@ -123,22 +206,39 @@ class AppCheckService : AccessibilityService() {
         }
     }
 
+    private fun eventTypeName(type: Int): String = when (type) {
+        AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> "WINDOW_STATE_CHANGED"
+        AccessibilityEvent.TYPE_WINDOWS_CHANGED -> "WINDOWS_CHANGED"
+        AccessibilityEvent.TYPE_VIEW_SELECTED -> "VIEW_SELECTED"
+        AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> "WINDOW_CONTENT_CHANGED"
+        else -> "TYPE_$type"
+    }
+
     // --- Overlay PLEIN ECRAN (TikTok / YouTube / dangerZone) ---
     private fun ensureFullScreenOverlayShown() {
         if (overlayMode == OverlayMode.TIMER_FULLSCREEN && overlayView != null) return
 
-        // Si un overlay d'un autre type est actif, on le retire avant
         hideOverlayOnly()
 
         val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
+        // Couvre tout l'écran sauf la barre de navigation système (home/retour).
+        val navBarHeight = getNavigationBarHeight()
+        val overlayHeightPx = (resources.displayMetrics.heightPixels - navBarHeight)
+            .coerceAtLeast(200)
+
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayHeightPx,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
-        )
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+        }
 
         val view = LayoutInflater.from(this).inflate(R.layout.overlay_layout, null)
         windowManager.addView(view, params)
@@ -199,8 +299,13 @@ class AppCheckService : AccessibilityService() {
             }
 
             override fun onFinish() {
-                // Le package qui était en attente peut désormais être utilisé librement
-                unlockedPackage = timerPackage
+                val finishedFor = timerPackage
+                FocusLog.d("timer FINISHED for pkg=$finishedFor")
+                if (finishedFor == InstagramScreenDetector.PACKAGE) {
+                    instagramFeedFinished = true
+                } else {
+                    unlockedPackage = finishedFor
+                }
                 removeOverlayAndCancelTimer()
             }
         }.start()
@@ -237,12 +342,20 @@ class AppCheckService : AccessibilityService() {
         hideOverlayOnly()
     }
 
+    private fun getNavigationBarHeight(): Int {
+        val resId = resources.getIdentifier("navigation_bar_height", "dimen", "android")
+        return if (resId > 0) resources.getDimensionPixelSize(resId) else 0
+    }
+
     override fun onInterrupt() {
         removeOverlayAndCancelTimer()
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+
+        FocusLog.init(this, truncate = true)
+        FocusLog.d("onServiceConnected")
 
         val channelId = "focustimer_channel"
 

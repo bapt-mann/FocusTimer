@@ -51,18 +51,7 @@ class MainActivity : AppCompatActivity() {
         // 2. Bouton pour cacher l'application
         val hideButton = findViewById<Button>(R.id.hideAppButton)
         hideButton.setOnClickListener {
-            if (isDebugBuild) {
-                // En dev, on refuse de se cacher : ça te bloquerait l'itération
-                // (Android Studio ne peut plus lancer une Activity désactivée).
-                // La feature reste active en build release.
-                Toast.makeText(
-                    this,
-                    "⚠️ Désactivé en mode dev (build release seulement)",
-                    Toast.LENGTH_LONG
-                ).show()
-            } else {
-                hideAppIcon()
-            }
+            hideAppIcon()
         }
     }
 
